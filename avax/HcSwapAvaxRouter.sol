@@ -15,13 +15,14 @@ import './interfaces/IUniswapV2Pair.sol';
 import './interfaces/IHcSwapAvaxPair.sol';
 import './interfaces/IHcTokenFactory.sol';
 import '../public/contract/Pausable.sol';
+import "openzeppelin3/proxy/Initializable.sol";
 
-contract HcSwapAvaxRouter is IUniswapV2Router02, Pausable {
+contract HcSwapAvaxRouter is IUniswapV2Router02, Pausable, Initializable {
     using SafeMath for uint;
 
-    address public immutable override factory;
-    address public immutable override WETH;
-    address public immutable tokenFactory;
+    address public override factory;
+    address public override WETH;
+    address public tokenFactory;
 
     address public owner;
     mapping(address => bool) public operator;
@@ -114,7 +115,9 @@ contract HcSwapAvaxRouter is IUniswapV2Router02, Pausable {
         }
     }
 
-    constructor(address _factory, address _WETH, address _tokenFactory) public {
+    constructor() public initializer {}
+
+    function initialize(address _factory, address _WETH, address _tokenFactory) public initializer{
         factory = _factory;
         WETH = _WETH;
         tokenFactory = _tokenFactory;

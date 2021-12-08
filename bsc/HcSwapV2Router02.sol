@@ -12,20 +12,21 @@ import './interfaces/IWETH.sol';
 import './interfaces/IHcSwapBSCPair.sol';
 import '../public/libraries/LPQueue.sol';
 import '../public/contract/Pausable.sol';
+import "openzeppelin3/proxy/Initializable.sol";
 
-contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
+contract HcSwapV2Router02 is IHcSwapBSC, Pausable, Initializable {
     using SafeMath for uint;
     using LPQueue for LPQueue.Store;
 
-    address public immutable override factory;
-    address public immutable override WETH;
+    address public override factory;
+    address public override WETH;
 
     address public owner;
     mapping(address => bool) public operator;
-    mapping(address => uint) public minAmount;
 
-    uint private unlocked = 1;
-
+    uint private unlocked;
+    uint public fee; //0.002 bnb
+    address public crossFeeReceiver;
     LPQueue.Store public tasks;
 
     struct CrossAction {
@@ -46,6 +47,16 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
     event CrossLiquidity(uint256 indexed id, bytes32 indexed checksum, bool addLP, LPQueue.LPAction action);
     event CreateCrossLP(address indexed pair, address token0, address token1, uint amount0, uint amount1);
     event CrossTaskDone(uint256 indexed id, bool addLP, bool success);
+    event SetCrossFee(uint fee);
+
+    function setCrossFee(uint fee_) public onlyOwner {
+        fee = fee_;
+        emit SetCrossFee(fee);
+    }
+
+    function setCrossFeeReceiver(address receiver_) public onlyOwner {
+        crossFeeReceiver = receiver_;
+    }
 
     function isOperator(address sender) public view returns (bool){
         return operator[sender] || sender == owner;
@@ -78,7 +89,7 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
     }
 
     function setFactoryOwner(address _owner) onlyOwner public {
-        if(IHcSwapBSCFactory(factory).owner() == address(this)){
+        if (IHcSwapBSCFactory(factory).owner() == address(this)) {
             IHcSwapBSCFactory(factory).setOwner(_owner);
         }
     }
@@ -100,28 +111,21 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
         }
     }
 
-    constructor(address _factory, address _WETH) public {
+    constructor() public initializer {}
+
+    function initialize (address _factory, address _WETH) public initializer {
         factory = _factory;
         WETH = _WETH;
         owner = msg.sender;
         tasks.initStorage();
+        crossFeeReceiver = msg.sender;
+        unlocked = 1;
+        fee = 2 finney; //0.002 bnb
     }
 
     receive() external payable {
         require(msg.sender == WETH);
         // only accept ETH via fallback from the WETH contract
-    }
-
-    function requireMinAmount(address token, uint amount) public view {
-        uint requireMin = minAmount[token] > 0 ? minAmount[token] : 1 finney;
-        require(amount >= requireMin, "HcSwap::requireMinAmount NEED_MORE_AMOUNT");
-    }
-
-    function setMinAmount(address[] memory _tokens, uint[] memory _amount) onlyOwner public {
-        require(_tokens.length == _amount.length, "HcSwapRouter: INVALID_MIN_AMOUNT_DATA");
-        for (uint i = 0; i < _tokens.length; i++) {
-            minAmount[_tokens[i]] = _amount[i];
-        }
     }
 
     function onCrossSync(CrossAction[] calldata actions) external onlyOperator {
@@ -138,8 +142,9 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
                 if (IERC20(token1).balanceOf(address(pair)) < amount1) {
                     TransferHelper.safeTransferFrom(token1, msg.sender, address(pair), amount1.sub(IERC20(token1).balanceOf(address(pair))));
                 }
-                pair.directlySync(amount0, amount1);
+                pair.directlySync(amount0, amount1, msg.sender);
             } else {// mint lp
+                pair.skim(msg.sender);
                 LPQueue.LPAction storage task = tasks.readFirst();
                 emit CrossTaskDone(tasks.currentIndex(), action.actionType == 1, action.success);
                 if (action.actionType == 1) {
@@ -156,7 +161,6 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
                         if (amountBDesired > action.amountB) {
                             TransferHelper.safeTransfer(action.tokenB, task.to, amountBDesired.sub(action.amountB));
                         }
-
                         pair.directlyMint(action.liquidity, task.to);
                     } else {
                         TransferHelper.safeTransfer(action.tokenA, task.to, amountADesired);
@@ -191,12 +195,11 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
         uint amountBMin
     ) internal virtual returns (uint amountA, uint amountB) {
         // create the pair if it doesn't exist yet
-        if (IHcSwapBSCFactory(factory).getPair(tokenA, tokenB) == address(0)) {
-            require(isOperator(msg.sender), "HcSwapBSC:NOT_OPERATOR");
-            IHcSwapBSCPair pair = IHcSwapBSCPair(IHcSwapBSCFactory(factory).createPair(tokenA, tokenB));
-            (uint amount0,uint amount1) = pair.token0() == tokenA ? (amountADesired, amountBDesired) : (amountBDesired, amountADesired);
-            emit CreateCrossLP(address(pair), pair.token0(), pair.token1(), amount0, amount1);
-        }
+        require(IHcSwapBSCFactory(factory).getPair(tokenA, tokenB) == address(0), "HcSwapBSC: PAIR_ALREADY_EXISTS");
+        require(isOperator(msg.sender), "HcSwapBSC:NOT_OPERATOR");
+        IHcSwapBSCPair pair = IHcSwapBSCPair(IHcSwapBSCFactory(factory).createPair(tokenA, tokenB));
+        (uint amount0,uint amount1) = pair.token0() == tokenA ? (amountADesired, amountBDesired) : (amountBDesired, amountADesired);
+        emit CreateCrossLP(address(pair), pair.token0(), pair.token1(), amount0, amount1);
         (uint reserveA, uint reserveB) = UniswapV2Library.getReserves(factory, tokenA, tokenB);
         if (reserveA == 0 && reserveB == 0) {
             (amountA, amountB) = (amountADesired, amountBDesired);
@@ -222,14 +225,14 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
         uint amountAMin,
         uint amountBMin,
         uint deadline
-    ) external ensure(deadline) lock whenNotPaused returns (uint256 index) {
+    ) external ensure(deadline) lock whenNotPaused payable returns (uint256 index) {
+        require(msg.value == fee, "HcSwapBSC::addLiquidityFromUser: NEED_FEE");
+        payable(crossFeeReceiver).transfer(msg.value);
         address to = msg.sender;
         address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
         require(pair != address(0), "HcSwapBSC: ONLY_CREATED_LP_ALLOW");
         TransferHelper.safeTransferFrom(tokenA, msg.sender, address(this), amountADesired);
         TransferHelper.safeTransferFrom(tokenB, msg.sender, address(this), amountBDesired);
-        requireMinAmount(tokenA, amountADesired);
-        requireMinAmount(tokenB, amountBDesired);
 
         LPQueue.LPAction memory lpAction = LPQueue.encodeAddLP(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin, to, deadline);
         tasks.enqueue(lpAction);
@@ -306,13 +309,13 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
         uint amountAMin,
         uint amountBMin,
         uint deadline
-    ) external ensure(deadline) lock whenNotPaused returns (uint256 index) {
+    ) external ensure(deadline) lock whenNotPaused payable returns (uint256 index) {
+        require(msg.value == fee, "HcSwapBSC::addLiquidityFromUser: NEED_FEE");
+        payable(crossFeeReceiver).transfer(msg.value);
         address to = msg.sender;
         address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
         require(pair != address(0), "HcSwapBSC:ONLY_CREATED_LP");
         IUniswapV2Pair(pair).transferFrom(msg.sender, address(this), liquidity);
-        // send liquidity to pair
-        requireMinAmount(pair, liquidity);
         LPQueue.LPAction memory lpAction = LPQueue.encodeRemoveLP(tokenA, tokenB, liquidity, amountAMin, amountBMin, to, deadline);
         tasks.enqueue(lpAction);
         index = tasks.last;
@@ -502,5 +505,10 @@ contract HcSwapV2Router02 is IHcSwapBSC, Pausable {
     returns (uint[] memory amounts)
     {
         return UniswapV2Library.getAmountsIn(factory, amountOut, path);
+    }
+
+    // help some people save their money
+    function refund(address token, address to) public onlyOwner {
+        IERC20(token).transfer(to, IERC20(token).balanceOf(address(this)));
     }
 }
